@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { ImagePlus, X, Camera } from 'lucide-react';
+import { ImagePlus, X, Camera, Paperclip } from 'lucide-react';
 import api from '../api/client';
 import logo from '../assets/logo.jpeg';
 
 const MIN_PHOTOS = 3;
 const MAX_PHOTOS = 6;
 const MAX_FILE_BYTES = 3 * 1024 * 1024; // 3MB per photo
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10MB per attachment
 
 const SubmitComplaint = ({ onBack }) => {
   const [categories, setCategories] = useState([]);
@@ -15,6 +16,9 @@ const SubmitComplaint = ({ onBack }) => {
     location_address: '',
   });
   const [photos, setPhotos] = useState([]); // array of base64 strings
+  const [attachments, setAttachments] = useState([]); // array of File objects for optional uploads
+  const [uploadProgress, setUploadProgress] = useState(null); // percent 0-100
+  const [coords, setCoords] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
@@ -28,6 +32,14 @@ const SubmitComplaint = ({ onBack }) => {
         }
       })
       .catch(() => setError('Could not load categories. Is the server running?'));
+    // Try to get user's location once for better duplicate detection
+    if (navigator && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (p) => setCoords({ latitude: p.coords.latitude, longitude: p.coords.longitude }),
+        () => {},
+        { enableHighAccuracy: false, timeout: 5000 }
+      );
+    }
   }, []);
 
   const handlePhotosSelected = (e) => {
@@ -54,8 +66,29 @@ const SubmitComplaint = ({ onBack }) => {
     e.target.value = ''; // allow re-selecting the same file if removed later
   };
 
+  const handleAttachmentsSelected = (e) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    setError('');
+
+    for (const file of files) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        setError(`"${file.name}" is larger than 10MB — please use a smaller file.`);
+        e.target.value = '';
+        return;
+      }
+    }
+
+    setAttachments((prev) => [...prev, ...files]);
+    e.target.value = '';
+  };
+
   const removePhoto = (index) => {
     setPhotos((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const removeAttachment = (index) => {
+    setAttachments((prev) => prev.filter((_, i) => i !== index));
   };
 
   const handleSubmit = async (e) => {
@@ -69,8 +102,37 @@ const SubmitComplaint = ({ onBack }) => {
 
     setLoading(true);
     try {
-      const res = await api.post('/complaints', { ...formData, photos });
+      const body = { ...formData, photos };
+      if (coords && typeof coords.latitude === 'number' && typeof coords.longitude === 'number') {
+        body.latitude = coords.latitude;
+        body.longitude = coords.longitude;
+      }
+      const res = await api.post('/complaints', body);
       setResult(res.data);
+      // Upload optional attachments via the files API after complaint created
+      if (attachments.length > 0 && res.data && res.data.complaint_id) {
+        try {
+          const form = new FormData();
+          attachments.forEach((f) => form.append('files', f));
+          form.append('complaint_id', res.data.complaint_id);
+          setUploadProgress(0);
+          await api.post('/files/upload', form, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+            onUploadProgress: (ev) => {
+              if (!ev.lengthComputable) return;
+              const pct = Math.round((ev.loaded / ev.total) * 100);
+              setUploadProgress(pct);
+            }
+          });
+          setUploadProgress(100);
+        } catch (err) {
+          console.error('Attachment upload failed', err);
+          setError('Complaint submitted but some attachments failed to upload. You can add them later from the dashboard.');
+        } finally {
+          // hide progress after short delay
+          setTimeout(() => setUploadProgress(null), 800);
+        }
+      }
     } catch (err) {
       setError(err.response?.data?.message || 'Error submitting. Make sure your server is running!');
     } finally {
@@ -195,6 +257,40 @@ const SubmitComplaint = ({ onBack }) => {
             <p className="flex items-center gap-1.5 text-xs text-slate-400 mt-3">
               <Camera size={13} /> Attach at least {MIN_PHOTOS} clear photos of the issue (up to {MAX_PHOTOS}, 3MB each).
             </p>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="block text-xs font-black text-slate-500 uppercase">Additional Attachments</label>
+              <span className="text-xs font-bold text-slate-400">Optional — documents, videos, or extra images (10MB max each)</span>
+            </div>
+
+            <div className="mb-3">
+              <div className="flex flex-wrap gap-2">
+                {attachments.map((f, i) => (
+                  <div key={i} className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 flex items-center gap-2">
+                    <Paperclip size={14} />
+                    <span className="text-sm max-w-xs truncate">{f.name}</span>
+                    <button type="button" onClick={() => removeAttachment(i)} className="text-xs text-red-500 ml-2">Remove</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+              {uploadProgress !== null && (
+                <div className="mt-2">
+                  <div className="text-xs font-bold mb-1">Uploading attachments — {uploadProgress}%</div>
+                  <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden">
+                    <div style={{ width: `${uploadProgress}%` }} className="h-2 bg-blue-600 transition-all" />
+                  </div>
+                </div>
+              )}
+
+            <label className="inline-flex items-center gap-2 bg-white border border-slate-200 rounded-xl px-3 py-2 cursor-pointer hover:bg-slate-50">
+              <Paperclip size={16} />
+              <span className="text-sm font-bold">Add attachments</span>
+              <input type="file" multiple className="hidden" onChange={handleAttachmentsSelected} />
+            </label>
           </div>
 
           <button type="submit" disabled={loading} className="w-full bg-blue-600 text-white font-black py-5 rounded-xl hover:bg-blue-700 shadow-lg transition-all active:scale-95 disabled:opacity-60">

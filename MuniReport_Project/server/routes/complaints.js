@@ -46,23 +46,45 @@ router.post('/', requireRole('Citizen'), async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Basic duplicate detection: same category + address, reported in the
-    // last 7 days and not yet resolved.
-    const dupCheck = await client.query(
-      `SELECT complaint_id FROM complaints
-       WHERE category_id = $1 AND LOWER(location_address) = LOWER($2)
-         AND status != 'Resolved' AND created_at > NOW() - INTERVAL '7 days'`,
-      [category_id, location_address]
-    );
-    const isDuplicate = dupCheck.rows.length > 0;
+    // Duplicate detection:
+    // If GPS coordinates are provided, perform a geospatial fuzzy match
+    // (Haversine approximation) within a 100m radius for same category
+    // reported within the last 7 days. Otherwise fall back to exact
+    // category + address match.
+    const latitude = typeof req.body.latitude === 'number' ? req.body.latitude : null;
+    const longitude = typeof req.body.longitude === 'number' ? req.body.longitude : null;
+    let isDuplicate = false;
+    if (latitude !== null && longitude !== null) {
+      const radiusMeters = 100; // treat reports within 100m as potential duplicates
+      const geoQ = await client.query(
+        `SELECT complaint_id FROM complaints
+         WHERE category_id = $1 AND status != 'Resolved' AND created_at > NOW() - INTERVAL '7 days'
+           AND latitude IS NOT NULL AND longitude IS NOT NULL
+           AND (6371000 * acos(
+             cos(radians($2)) * cos(radians(latitude)) * cos(radians(longitude) - radians($3)) +
+             sin(radians($2)) * sin(radians(latitude))
+           )) <= $4`,
+        [category_id, latitude, longitude, radiusMeters]
+      );
+      isDuplicate = geoQ.rows.length > 0;
+    }
+    if (!isDuplicate) {
+      const dupCheck = await client.query(
+        `SELECT complaint_id FROM complaints
+         WHERE category_id = $1 AND LOWER(location_address) = LOWER($2)
+           AND status != 'Resolved' AND created_at > NOW() - INTERVAL '7 days'`,
+        [category_id, location_address]
+      );
+      isDuplicate = dupCheck.rows.length > 0;
+    }
 
     const referenceNumber = generateReferenceNumber();
     const complaintResult = await client.query(
       `INSERT INTO complaints
-         (reference_number, description, location_address, citizen_id, category_id, status, is_duplicate)
-       VALUES ($1, $2, $3, $4, $5, 'Pending', $6)
+         (reference_number, description, location_address, citizen_id, category_id, status, is_duplicate, latitude, longitude)
+       VALUES ($1, $2, $3, $4, $5, 'Pending', $6, $7, $8)
        RETURNING complaint_id, reference_number, status, is_duplicate, created_at`,
-      [referenceNumber, description, location_address, req.user.id, category_id, isDuplicate]
+      [referenceNumber, description, location_address, req.user.id, category_id, isDuplicate, latitude, longitude]
     );
     const complaint = complaintResult.rows[0];
 
@@ -201,6 +223,26 @@ router.delete('/:id', requireRole('Municipal Officer', 'Admin'), async (req, res
   }
 });
 
+// --- Municipal Officer / Supervisor / Admin: manually flag or clear duplicate status (FR3 enhancement) ---
+router.patch('/:id/flag-duplicate', requireRole('Municipal Officer', 'Supervisor', 'Admin'), async (req, res) => {
+  try {
+    const { is_duplicate } = req.body;
+    if (typeof is_duplicate !== 'boolean') return res.status(400).json({ message: 'is_duplicate (boolean) is required.' });
+
+    const result = await pool.query(
+      `UPDATE complaints SET is_duplicate = $1, updated_at = NOW() WHERE complaint_id = $2 RETURNING complaint_id`,
+      [is_duplicate, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Complaint not found.' });
+
+    await logAction(req.user.id, 'FLAG_DUPLICATE', 'complaints', req.params.id, `is_duplicate:${is_duplicate}`);
+    res.json({ message: `is_duplicate set to ${is_duplicate}` });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ message: 'Could not update duplicate flag.' });
+  }
+});
+
 // --- Supervisor / Admin: assign a complaint to a Field Inspector (FR5) ---
 router.patch('/:id/assign', requireRole('Supervisor', 'Admin'), async (req, res) => {
   try {
@@ -289,6 +331,33 @@ router.post('/:id/inspection', requireRole('Field Inspector'), async (req, res) 
     res.status(500).json({ message: 'Could not submit inspection report.' });
   } finally {
     client.release();
+  }
+});
+
+// --- View inspection reports for a complaint ---
+router.get('/:id/inspections', requireRole('Municipal Officer', 'Supervisor', 'Data Analyst', 'Admin', 'Field Inspector', 'Citizen'), async (req, res) => {
+  try {
+    // Citizens may only view reports for their own complaints
+    const params = [req.params.id];
+    let where = 'ir.complaint_id = $1';
+    if (req.user.role === 'Citizen') {
+      where += ' AND c.citizen_id = $2';
+      params.push(req.user.id);
+    }
+
+    const result = await pool.query(
+      `SELECT ir.report_id, ir.findings, ir.is_false_report, ir.created_at,
+              u.user_id AS inspector_id, u.full_name AS inspector_name
+       FROM inspection_reports ir
+       JOIN users u ON u.user_id = ir.inspector_id
+       JOIN complaints c ON c.complaint_id = ir.complaint_id
+       WHERE ${where} ORDER BY ir.created_at DESC`,
+      params
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ message: 'Could not load inspection reports.' });
   }
 });
 

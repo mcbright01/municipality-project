@@ -6,12 +6,62 @@ import { StatCard } from './CitizenPanel';
 const AnalystPanel = () => {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [filters, setFilters] = useState({ start: '', end: '', category: '', area: '' });
+  const [report, setReport] = useState(null);
+  const [reportLoading, setReportLoading] = useState(false);
 
   useEffect(() => {
+    // initial unfiltered summary
     api.get('/summary')
       .then((res) => setSummary(res.data))
       .finally(() => setLoading(false));
   }, []);
+
+  const refreshSummary = async () => {
+    setLoading(true);
+    const qs = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => { if (v) qs.set(k, v); });
+    const url = `/summary${qs.toString() ? `?${qs.toString()}` : ''}`;
+    try {
+      const res = await api.get(url);
+      setSummary(res.data);
+    } catch (e) {
+      console.error('Could not refresh summary', e);
+    } finally { setLoading(false); }
+  };
+
+  const downloadCSV = () => {
+    const qs = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => { if (v) qs.set(k, v); });
+    const url = `/export${qs.toString() ? `?${qs.toString()}` : ''}`;
+    api.get(url, { responseType: 'blob' })
+      .then((res) => {
+        const blob = new Blob([res.data], { type: 'text/csv' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = 'complaints_export.csv';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      })
+      .catch(() => alert('Could not download CSV.'));
+  };
+
+  const loadResolutionReport = async () => {
+    setReportLoading(true);
+    const qs = new URLSearchParams();
+    if (filters.start) qs.set('start', filters.start);
+    if (filters.end) qs.set('end', filters.end);
+    if (filters.category) qs.set('category', filters.category);
+    try {
+      const res = await api.get(`/reports/resolution-time${qs.toString() ? `?${qs.toString()}` : ''}`);
+      setReport(res.data);
+    } catch (e) {
+      console.error('Could not load report', e);
+      setReport(null);
+      alert('Could not load resolution time report.');
+    } finally { setReportLoading(false); }
+  };
 
   if (loading) return <p className="text-center text-slate-400 py-12">Loading statistics…</p>;
   if (!summary) return <p className="text-center text-red-500 py-12">Could not load statistics.</p>;
@@ -24,6 +74,39 @@ const AnalystPanel = () => {
         <StatCard label="Total Complaints" value={summary.totals.total_complaints} icon={<BarChart3 className="text-blue-600" />} />
         <StatCard label="Flagged Duplicates" value={summary.totals.duplicate_count} icon={<Copy className="text-red-600" />} />
         <StatCard label="Registered Citizens" value={summary.totals.total_citizens} icon={<Users className="text-purple-600" />} />
+      </div>
+
+      <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-6 mt-6">
+        <h3 className="font-black text-slate-800 text-sm uppercase tracking-widest mb-4">Filters & Exports</h3>
+        <div className="flex flex-wrap gap-2 items-center">
+          <input type="date" value={filters.start} onChange={(e) => setFilters(f => ({...f, start: e.target.value}))} className="p-2 border rounded" />
+          <input type="date" value={filters.end} onChange={(e) => setFilters(f => ({...f, end: e.target.value}))} className="p-2 border rounded" />
+          <input placeholder="Area" value={filters.area} onChange={(e) => setFilters(f => ({...f, area: e.target.value}))} className="p-2 border rounded" />
+          <select value={filters.category} onChange={(e) => setFilters(f => ({...f, category: e.target.value}))} className="p-2 border rounded">
+            <option value="">All categories</option>
+            {summary.byCategory.map(c => <option key={c.category} value={c.category}>{c.category}</option>)}
+          </select>
+          <button onClick={refreshSummary} className="ml-2 bg-blue-600 text-white px-4 py-2 rounded">Apply</button>
+          <button onClick={downloadCSV} className="ml-2 bg-green-600 text-white px-4 py-2 rounded">Download CSV</button>
+          <button onClick={loadResolutionReport} className="ml-2 bg-indigo-600 text-white px-4 py-2 rounded">Resolution Time Report</button>
+        </div>
+
+        {reportLoading && <p className="text-sm text-slate-400 mt-3">Loading report…</p>}
+        {report && (
+          <div className="mt-4">
+            <h4 className="font-bold text-sm mb-2">Resolution Time (seconds)</h4>
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr className="text-left"><th className="p-2">Inspector</th><th className="p-2">Count</th><th className="p-2">Avg (s)</th><th className="p-2">Min (s)</th><th className="p-2">Max (s)</th></tr>
+              </thead>
+              <tbody>
+                {report.map(r => (
+                  <tr key={r.inspector_id} className="border-t"><td className="p-2">{r.inspector_name || 'Unassigned'}</td><td className="p-2">{r.resolved_count}</td><td className="p-2">{r.avg_seconds}</td><td className="p-2">{r.min_seconds}</td><td className="p-2">{r.max_seconds}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-8">
