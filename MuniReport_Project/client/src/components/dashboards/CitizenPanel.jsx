@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { FileText, Clock, CheckCircle, XCircle } from 'lucide-react';
+import { FileText, Clock, CheckCircle, XCircle, Paperclip } from 'lucide-react';
 import api from '../../api/client';
 
 const statusStyles = {
@@ -18,7 +18,19 @@ const CitizenPanel = ({ onNavigateSubmit }) => {
   const load = () => {
     setLoading(true);
     api.get('/complaints/mine')
-      .then((res) => setComplaints(res.data))
+      .then(async (res) => {
+        const list = res.data || [];
+        // fetch attachments for each complaint in parallel
+        const enriched = await Promise.all(list.map(async (c) => {
+          try {
+            const r = await api.get(`/files/complaint/${c.complaint_id}`);
+            return { ...c, attachments: r.data };
+          } catch (e) {
+            return { ...c, attachments: [] };
+          }
+        }));
+        setComplaints(enriched);
+      })
       .catch(() => setError('Could not load your complaints.'))
       .finally(() => setLoading(false));
   };
@@ -32,6 +44,22 @@ const CitizenPanel = ({ onNavigateSubmit }) => {
       load();
     } catch (err) {
       alert(err.response?.data?.message || 'Could not cancel complaint.');
+    }
+  };
+
+  const downloadFile = async (file) => {
+    try {
+      const resp = await api.get(`/files/${file.file_id}`, { responseType: 'blob' });
+      const url = window.URL.createObjectURL(resp.data);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.original_name || 'attachment';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      alert('Could not download file.');
     }
   };
 
@@ -83,6 +111,14 @@ const CitizenPanel = ({ onNavigateSubmit }) => {
                   <p className="text-slate-600 text-sm mt-1">{c.category} — {c.location_address}</p>
                   <p className="text-slate-400 text-xs mt-1">{new Date(c.created_at).toLocaleDateString()}</p>
                   <PhotoStrip photos={c.photos} />
+                    {c.attachments && c.attachments.length > 0 && (
+                      <div className="mt-3 flex flex-wrap gap-2 items-center">
+                        <Paperclip size={14} className="text-slate-400" />
+                        {c.attachments.map((f) => (
+                          <button key={f.file_id} onClick={() => downloadFile(f)} className="text-sm text-blue-600 underline truncate max-w-[200px]">{f.original_name}</button>
+                        ))}
+                      </div>
+                    )}
                 </div>
                 <div className="flex items-center gap-3">
                   <span className={`text-xs font-bold uppercase tracking-wide px-3 py-1 rounded-full border ${statusStyles[c.status] || ''}`}>
